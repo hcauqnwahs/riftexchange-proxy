@@ -1,32 +1,80 @@
-export default async function handler(req, res) {
-  if (req.method === 'POST') {
-    return res.status(200).json({ status: 'ok' });
+// Module-level token cache (survives warm Lambda invocations)
+let cachedToken = null;
+let tokenExpiry = 0;
+
+async function getAccessToken() {
+  const now = Date.now();
+  if (cachedToken && now < tokenExpiry) return cachedToken;
+
+  const clientId = process.env.EBAY_CLIENT_ID;
+  const clientSecret = process.env.EBAY_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error('Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET environment variables');
   }
 
-  // Pass the raw query string directly — avoids URLSearchParams re-encoding
-  // parentheses in itemFilter(0).name into %28%29 which eBay doesn't accept
-  const rawQuery = req.url.includes('?') ? req.url.split('?').slice(1).join('?') : '';
-  const ebayURL = `https://svcs.ebay.com/services/search/FindingService/v1?${rawQuery}`;
+  const creds = Buffer.from(`${clientId}:${clientSecret}`).toString('base64');
+  const resp = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${creds}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: 'grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope'
+  });
 
-  console.log('[proxy] Calling eBay:', ebayURL);
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`OAuth failed (${resp.status}): ${body}`);
+  }
+  const data = await resp.json();
+  cachedToken = data.access_token;
+  tokenExpiry = now + (data.expires_in - 300) * 1000;
+  console.log('[proxy] Got eBay token, expires in', data.expires_in, 'seconds');
+  return cachedToken;
+}
+
+export default async function handler(req, res) {
+  const q = req.query.q || '';
+  const limit = Math.min(parseInt(req.query.limit) || 50, 100);
+
+  if (!q) return res.status(400).json({ error: 'Missing q parameter' });
+  console.log('[proxy] Search:', q, 'limit:', limit);
 
   try {
-    const response = await fetch(ebayURL, {
+    const token = await getAccessToken();
+
+    const url = new URL('https://api.ebay.com/buy/browse/v1/item_summary/search');
+    url.searchParams.set('q', q);
+    url.searchParams.set('limit', limit.toString());
+    url.searchParams.set('filter', 'buyingOptions:{FIXED_PRICE}');
+    url.searchParams.set('sort', 'price');
+    console.log('[proxy] Browse API URL:', url.toString());
+
+    const resp = await fetch(url.toString(), {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; RiftExchange/1.0)',
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
+        'Authorization': `Bearer ${token}`,
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
       }
     });
 
-    const body = await response.text();
-    console.log('[proxy] eBay status:', response.status);
-    console.log('[proxy] eBay headers:', JSON.stringify(Object.fromEntries(response.headers)));
-    console.log('[proxy] eBay body:', body.substring(0, 500));
+    const body = await resp.text();
+    console.log('[proxy] Browse API status:', resp.status, 'body:', body.substring(0, 300));
 
-    res.status(response.status).setHeader('Content-Type', 'application/json').send(body);
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: 'Browse API error' });
+    }
+
+    const data = JSON.parse(body);
+    const now = new Date().toISOString();
+    const prices = (data.itemSummaries || [])
+      .map(item => ({ price: parseFloat(item.price?.value || '0'), date: now }))
+      .filter(p => p.price > 0);
+
+    console.log('[proxy] Returning', prices.length, 'prices');
+    return res.status(200).json(prices);
+
   } catch (e) {
     console.log('[proxy] Error:', e.message);
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: e.message });
   }
 }
